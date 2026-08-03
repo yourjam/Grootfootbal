@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fantasy Draft Board Live Sync (Yahoo -> Draft Board)
 // @namespace    jordan-three-phase-mafia
-// @version      1.0
+// @version      1.1
 // @description  No-OAuth, no-secrets bridge: reads picks off Yahoo's live draft page you're already logged into, and mirrors them into the draft board tab. Also works as a manual "click to log a pick" helper if auto-detection needs tuning.
 // @match        https://football.fantasysports.yahoo.com/*
 // @match        https://yourjam.github.io/Grootfootbal/*
@@ -80,12 +80,20 @@
     const panel = makeDebugPanel("Draft sync: watching Yahoo…");
     let pickCounter = 0;
 
-    // Strategy A: sniff fetch() responses for anything draft-result-shaped
-    const origFetch = window.fetch;
-    window.fetch = function (...args) {
+    // IMPORTANT: Tampermonkey runs userscripts in an isolated JS world by default — patching
+    // plain `window.fetch` here only rewrites the userscript's own private copy, which the
+    // page's real code never calls. `unsafeWindow` is the actual page window; patching THAT
+    // is what lets us see requests Yahoo's own client makes. (Confirmed via a real mock draft:
+    // requests to pub-api.fantasysports.yahoo.com/fantasy/v3/... were firing constantly, but
+    // the old window.fetch patch never saw a single one.)
+    const pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
+
+    // Strategy A: sniff fetch() responses for anything draft/pick-shaped
+    const origFetch = pageWindow.fetch;
+    pageWindow.fetch = function (...args) {
       return origFetch.apply(this, args).then(res => {
         const url = typeof args[0] === "string" ? args[0] : (args[0] && args[0].url) || "";
-        if (/draft/i.test(url)) {
+        if (/draft|pick/i.test(url)) {
           res.clone().text().then(text => {
             console.log("[FFDB sync] fetch from", url, "-> first 500 chars:", text.slice(0, 500));
             tryParseDraftPayload(text, "fetch:" + url);
@@ -95,11 +103,11 @@
       });
     };
 
-    // Strategy A2: sniff XHR too, in case the draft client uses XMLHttpRequest instead of fetch
-    const origOpen = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    // Strategy A2: sniff XHR too, in case some calls use XMLHttpRequest instead of fetch
+    const origOpen = pageWindow.XMLHttpRequest.prototype.open;
+    pageWindow.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
       this.addEventListener("load", function () {
-        if (/draft/i.test(url)) {
+        if (/draft|pick/i.test(url)) {
           console.log("[FFDB sync] XHR from", url, "-> first 500 chars:", String(this.responseText).slice(0, 500));
           tryParseDraftPayload(this.responseText, "xhr:" + url);
         }
@@ -107,9 +115,38 @@
       return origOpen.call(this, method, url, ...rest);
     };
 
+    // Strategy A3: WebSocket sniffing. Yahoo's own /fantasy/v3/draftstatus endpoint returns a
+    // dedicated draft_server + draft_port (a real AWS host, not the main API host) — that's a
+    // strong signal live picks are pushed over a WebSocket, not polled via HTTP at all. This
+    // patches the WebSocket constructor so any socket the page opens gets its messages logged.
+    const OrigWebSocket = pageWindow.WebSocket;
+    if (OrigWebSocket) {
+      function PatchedWebSocket(url, protocols) {
+        const ws = protocols !== undefined ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
+        console.log("[FFDB sync] WebSocket opened:", url);
+        panel.log("WebSocket opened: " + String(url).slice(0, 60));
+        ws.addEventListener("message", (ev) => {
+          const data = typeof ev.data === "string" ? ev.data : null;
+          if (data) {
+            console.log("[FFDB sync] WS message from", url, "->", data.slice(0, 500));
+            tryParseDraftPayload(data, "ws:" + url);
+          }
+        });
+        return ws;
+      }
+      PatchedWebSocket.prototype = OrigWebSocket.prototype;
+      Object.setPrototypeOf(PatchedWebSocket, OrigWebSocket);
+      pageWindow.WebSocket = PatchedWebSocket;
+    }
+
     function tryParseDraftPayload(text, source) {
       let data;
-      try { data = JSON.parse(text); } catch (e) { return; }
+      try { data = JSON.parse(text); } catch (e) {
+        // Not JSON — still worth a peek in console if it's short, some draft protocols use
+        // lightweight delimited text frames over the socket rather than JSON.
+        if (text && text.length < 300) console.log("[FFDB sync] non-JSON payload from", source, text);
+        return;
+      }
       // Walk the JSON looking for arrays of objects that look like {player, team, pick...}
       const candidates = [];
       (function walk(node, depth) {
