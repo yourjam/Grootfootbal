@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fantasy Draft Board Live Sync (Yahoo -> Draft Board)
 // @namespace    jordan-three-phase-mafia
-// @version      1.2
+// @version      1.3
 // @description  No-OAuth, no-secrets bridge: reads picks off Yahoo's live draft page you're already logged into, and mirrors them into the draft board tab. Also works as a manual "click to log a pick" helper if auto-detection misses one.
 // @match        https://football.fantasysports.yahoo.com/*
 // @match        https://yourjam.github.io/Grootfootbal/*
@@ -44,6 +44,13 @@
     2. On the draft board (yourjam.github.io/Grootfootbal): polls GM storage for new picks and
        calls the board's existing draftPlayer() logic directly (via unsafeWindow) to check them
        off, exactly like clicking "Mine" / "Off board" yourself.
+
+  v1.3 fix: live-tested v1.2 in a real mock draft and found "isMe" detection was broken — the
+  banner shows your real account name ("Jordan"), not the literal string "You", so every one of
+  your own picks was being logged as someone else's and never credited to "My Team" on the
+  board. Fixed by cross-checking Yahoo's own "YOUR TEAM (n/15)" panel instead, which lists your
+  drafted players by name — confirmed correct in the same live draft (Jahmyr Gibbs now shows
+  up as mine).
 
   KNOWN LIMITATION: the "Last:" banner only ever shows the single most-recent pick. If two
   picks happen faster than the ~1.2s poll (e.g. two people autodrafting back-to-back in the
@@ -120,17 +127,37 @@
       return { name, pos, team, draftingTeam };
     }
 
+    // Whether a pick is "mine" can't be read off the "Last:" banner's team name — confirmed
+    // live that Yahoo shows your REAL account display name there (e.g. "Jordan"), not the
+    // literal string "You", so comparing against "You" silently misses every one of your own
+    // picks. Instead, check Yahoo's own "YOUR TEAM (n/15)" roster panel, which lists your
+    // drafted players by the same abbreviated name format as the banner — if the just-picked
+    // name shows up there, it's yours.
+    function findYourTeamPanel() {
+      const all = Array.from(document.querySelectorAll("body *"));
+      const hit = all.find(el => el.children.length === 0 && /^YOUR TEAM/i.test((el.textContent || "").trim()));
+      if (!hit) return null;
+      let panel = hit;
+      for (let i = 0; i < 3 && panel.parentElement; i++) panel = panel.parentElement;
+      return panel;
+    }
+    function isMyPick(name) {
+      const panel = findYourTeamPanel();
+      if (!panel) return false;
+      return panel.textContent.includes(name);
+    }
+
     function checkForNewPick() {
       const banner = readLastPickBanner();
       if (!banner) return;
-      const isMe = /^you$/i.test(banner.draftingTeam) || banner.draftingTeam === "You";
+      const isMe = isMyPick(banner.name);
       const added = pushPick({
         name: banner.name,
         pos: banner.pos,
-        team: banner.draftingTeam,
+        team: isMe ? "Me" : banner.draftingTeam,
         isMe
       });
-      if (added) panel.log(`Detected: ${banner.name} (${banner.pos || "?"}) -> ${banner.draftingTeam}`);
+      if (added) panel.log(`Detected: ${banner.name} (${banner.pos || "?"}) -> ${isMe ? "ME" : banner.draftingTeam}`);
     }
 
     // Base poll — catches every pick even if WebSocket sniffing below doesn't fire.
