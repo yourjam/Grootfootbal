@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fantasy Draft Board Live Sync (Yahoo -> Draft Board)
 // @namespace    jordan-three-phase-mafia
-// @version      1.3
+// @version      1.4
 // @description  No-OAuth, no-secrets bridge: reads picks off Yahoo's live draft page you're already logged into, and mirrors them into the draft board tab. Also works as a manual "click to log a pick" helper if auto-detection misses one.
 // @match        https://football.fantasysports.yahoo.com/*
 // @match        https://yourjam.github.io/Grootfootbal/*
@@ -100,6 +100,25 @@
 
   // ---------------- YAHOO SIDE ----------------
   if (isYahoo) {
+    // GM storage is shared across every page this script matches, indefinitely — it does NOT
+    // reset per draft. Discovered via testing: running two mock drafts back-to-back caused the
+    // second one's picks to be silently dropped, because early-round players (Bijan Robinson,
+    // Jahmyr Gibbs, etc.) are near-identical across mocks and the dedupe-by-name queue from
+    // draft #1 was still sitting there blocking them in draft #2. Not a real-draft-day problem
+    // (you only run the real draft once), but cheap to guard against: detect the draft room's
+    // ID from the URL, and wipe the queue whenever it changes.
+    const draftIdMatch = location.pathname.match(/\/draftclient\/f1\/(\d+)\//);
+    const currentDraftId = draftIdMatch ? draftIdMatch[1] : null;
+    if (currentDraftId) {
+      const lastDraftId = GM_getValue("ffdb_sync_draftid_v1", null);
+      if (lastDraftId !== currentDraftId) {
+        GM_setValue(STORE_KEY, "[]");
+        GM_setValue(SEEN_KEY, "[]");
+        GM_setValue("ffdb_sync_draftid_v1", currentDraftId);
+        console.log("[FFDB sync] New draft room (" + currentDraftId + ") — cleared sync queue left over from a previous draft.");
+      }
+    }
+
     const panel = makeDebugPanel("Draft sync: watching Yahoo…");
 
     // Reads the "Last: <Name> (POS · Team)" banner Yahoo renders in the draft room header.
