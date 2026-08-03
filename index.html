@@ -951,9 +951,53 @@ function renderAll() {
 // calls this from the draft board tab via unsafeWindow when it detects a new pick on Yahoo's
 // live draft page. No OAuth, no secrets — it just reads the authenticated page you're already
 // looking at and mirrors picks in here.
-function syncPickFromExternal(playerName, teamName, isMe) {
-  const p = PLAYERS.find(x => x.name === playerName ||
-    x.name.toLowerCase().replace(/[.'-]/g,"").includes(playerName.toLowerCase().replace(/[.'-]/g,"")));
+//
+// Yahoo's own live-draft DOM only exposes the most-recent pick as an ABBREVIATED name, e.g.
+// "J. Smith-Njigba" rather than "Jaxon Smith-Njigba" — confirmed against a real live draft room.
+// So matching has three tiers: exact full-name match, then "first-initial + last-name" (+ pos
+// as a tiebreak if provided) for the abbreviated case, then a last-resort unique-last-name match.
+function normalizeNamePart(s) {
+  return (s || "").toLowerCase().replace(/[.']/g, "").replace(/\s+/g, " ").trim();
+}
+function findPlayerFuzzy(playerName, pos) {
+  const norm = normalizeNamePart(playerName);
+  let p = PLAYERS.find(x => normalizeNamePart(x.name) === norm);
+  if (p) return p;
+
+  // "F. Last Name" abbreviated form (handles multi-word last names like "St. Brown")
+  const m = playerName.match(/^([A-Za-z])\.?\s+(.+)$/);
+  if (m) {
+    const initial = m[1].toLowerCase();
+    const lastNorm = normalizeNamePart(m[2]);
+    const candidates = PLAYERS.filter(x => {
+      const parts = x.name.split(" ");
+      const xLast = normalizeNamePart(parts.slice(1).join(" "));
+      return xLast === lastNorm && x.name[0].toLowerCase() === initial;
+    });
+    if (candidates.length === 1) return candidates[0];
+    if (candidates.length > 1 && pos) {
+      const posMatch = candidates.find(x => x.pos === pos);
+      if (posMatch) return posMatch;
+    }
+    if (candidates.length >= 1) return candidates[0];
+  }
+
+  // last-ditch: unique last-name-only match
+  const lastGuess = normalizeNamePart(playerName.split(" ").slice(-1)[0]);
+  if (lastGuess) {
+    const byLast = PLAYERS.filter(x => normalizeNamePart(x.name).endsWith(lastGuess));
+    if (byLast.length === 1) return byLast[0];
+    if (byLast.length > 1 && pos) {
+      const posMatch = byLast.find(x => x.pos === pos);
+      if (posMatch) return posMatch;
+    }
+  }
+
+  // old substring fallback, kept for safety
+  return PLAYERS.find(x => normalizeNamePart(x.name).includes(norm)) || null;
+}
+function syncPickFromExternal(playerName, teamName, isMe, pos) {
+  const p = findPlayerFuzzy(playerName, pos);
   if (!p || isDrafted(p.name)) return false;
   draftPlayer(p.name, isMe ? "mine" : "other", teamName);
   return true;

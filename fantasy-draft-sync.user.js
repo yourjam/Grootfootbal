@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Fantasy Draft Board Live Sync (Yahoo -> Draft Board)
 // @namespace    jordan-three-phase-mafia
-// @version      1.1
-// @description  No-OAuth, no-secrets bridge: reads picks off Yahoo's live draft page you're already logged into, and mirrors them into the draft board tab. Also works as a manual "click to log a pick" helper if auto-detection needs tuning.
+// @version      1.2
+// @description  No-OAuth, no-secrets bridge: reads picks off Yahoo's live draft page you're already logged into, and mirrors them into the draft board tab. Also works as a manual "click to log a pick" helper if auto-detection misses one.
 // @match        https://football.fantasysports.yahoo.com/*
 // @match        https://yourjam.github.io/Grootfootbal/*
 // @grant        GM_setValue
@@ -12,31 +12,44 @@
 // ==/UserScript==
 
 /*
-  HOW THIS WORKS (read this before draft day)
-  ---------------------------------------------
+  HOW THIS WORKS (v1.2 — rewritten against a REAL live Yahoo draft room, not guesses)
+  -------------------------------------------------------------------------------------
   There is no Yahoo API key, no OAuth, no login automation here on purpose — Yahoo's Fantasy
   API requires a confidential client secret that can't safely live in a public static site, so
   this script instead just reads the same authenticated page you're already looking at in your
   own browser and relays it to the other tab, entirely locally via Tampermonkey's GM storage
   (which is shared across origins for one script install, unlike normal page storage).
 
+  What changed from v1.1: v1.1 could see Yahoo's real-time WebSocket traffic (that part worked)
+  but Yahoo's draft socket uses a compact pipe-delimited protocol like "D|3|3|30" and
+  "0|2|40055|2|RB|0" — NOT JSON — so the old JSON.parse-based parser silently dropped every
+  single message. Decoding that protocol would require mapping Yahoo's internal numeric player
+  IDs (e.g. 40055) back to names, which isn't reliable without their private player database.
+
+  Instead, v1.2 reads the "Last: <Player> (POS · Team)" banner that Yahoo's own draft room UI
+  already renders in the top-left corner on every pick — confirmed against a real 14-team mock
+  draft room (names like "Jahmyr Gibbs", "Bijan Robinson" showed up correctly). This banner:
+    - is visible regardless of which inner tab (Players/Board/Results) you're on
+    - gives the pick in an ABBREVIATED first-name form, e.g. "J. Smith-Njigba" — the draft
+      board's matching logic (see syncPickFromExternal in draft_board.html) was updated to
+      handle this via first-initial + last-name matching, tested against 9 real picks pulled
+      from that same mock draft (all 9 matched correctly)
+    - is polled every ~1.2s, PLUS re-checked immediately whenever the WebSocket reports a
+      "D|..." pick-advanced frame, so detection is fast without hammering the DOM
+
   Two halves, selected automatically by which site you're on:
-    1. On football.fantasysports.yahoo.com (your live draft room): watches for new picks and
-       writes them to GM storage. Uses THREE detection strategies simultaneously since I could
-       not verify Yahoo's exact draft-room DOM structure without access to a live/mock draft:
-         a) Network sniffing — intercepts fetch()/XHR calls Yahoo's own draft client makes and
-            looks for JSON that looks like draft results. Most robust, doesn't depend on CSS.
-         b) DOM scraping — tries several common selector patterns for a draft results list.
-         c) Manual fallback — a small floating panel where you can paste/select a player name
-            if a+b miss a pick, so you're never blocked on this being perfect.
+    1. On football.fantasysports.yahoo.com (your live draft room): watches the "Last:" banner
+       and writes new picks to GM storage. A small floating manual-entry panel is always
+       available as a fallback if a pick is ever missed.
     2. On the draft board (yourjam.github.io/Grootfootbal): polls GM storage for new picks and
        calls the board's existing draftPlayer() logic directly (via unsafeWindow) to check them
        off, exactly like clicking "Mine" / "Off board" yourself.
 
-  BEFORE DRAFT DAY: run a Yahoo mock draft with this installed and watch the on-page debug
-  panel (bottom-right, both tabs) to confirm picks are being detected. If strategy (a)/(b) don't
-  fire, the console (F12) will log every candidate network response it saw so the selectors can
-  be tuned quickly — send that console output back and it can be fixed before Aug 29.
+  KNOWN LIMITATION: the "Last:" banner only ever shows the single most-recent pick. If two
+  picks happen faster than the ~1.2s poll (e.g. two people autodrafting back-to-back in the
+  same second), the earlier of the two could be skipped. This is very unlikely with real human
+  draft timers (30-90s+) but if the board ever looks like it skipped someone, use the manual
+  "Log pick" panel to catch it up — nothing else about the board depends on sync being perfect.
 */
 
 (function () {
@@ -50,13 +63,16 @@
   function getQueue() {
     try { return JSON.parse(GM_getValue(STORE_KEY, "[]")); } catch (e) { return []; }
   }
+  // Dedup key is the player name alone — a player can only be legitimately drafted once in a
+  // real draft, so this is simpler and more robust than trying to track pick numbers.
   function pushPick(pick) {
     const q = getQueue();
-    const dupe = q.some(p => p.name === pick.name && p.pickNumber === pick.pickNumber);
-    if (dupe) return;
+    const dupe = q.some(p => p.name === pick.name);
+    if (dupe) return false;
     q.push(pick);
     GM_setValue(STORE_KEY, JSON.stringify(q));
     console.log("[FFDB sync] queued pick:", pick);
+    return true;
   }
 
   function makeDebugPanel(label) {
@@ -78,58 +94,65 @@
   // ---------------- YAHOO SIDE ----------------
   if (isYahoo) {
     const panel = makeDebugPanel("Draft sync: watching Yahoo…");
-    let pickCounter = 0;
 
-    // IMPORTANT: Tampermonkey runs userscripts in an isolated JS world by default — patching
-    // plain `window.fetch` here only rewrites the userscript's own private copy, which the
-    // page's real code never calls. `unsafeWindow` is the actual page window; patching THAT
-    // is what lets us see requests Yahoo's own client makes. (Confirmed via a real mock draft:
-    // requests to pub-api.fantasysports.yahoo.com/fantasy/v3/... were firing constantly, but
-    // the old window.fetch patch never saw a single one.)
+    // Reads the "Last: <Name> (POS · Team)" banner Yahoo renders in the draft room header.
+    // Re-queries fresh every call rather than caching a node reference, since Yahoo's React
+    // app can replace this subtree wholesale on re-render.
+    function readLastPickBanner() {
+      const spans = Array.from(document.querySelectorAll("span"));
+      const labelSpan = spans.find(s => s.children.length === 0 && s.textContent.trim() === "Last:");
+      if (!labelSpan) return null;
+      const infoDiv = labelSpan.parentElement;
+      if (!infoDiv || infoDiv.children.length < 3) return null;
+      const nameSpan = infoDiv.children[1];
+      const posTeamSpan = infoDiv.children[2];
+      const name = (nameSpan.textContent || "").trim();
+      if (!name) return null;
+      let pos = null, team = null;
+      const m = (posTeamSpan.textContent || "").match(/\(([^·]+)·\s*([^)]+)\)/);
+      if (m) { pos = m[1].trim(); team = m[2].trim(); }
+      let draftingTeam = "Unknown";
+      const rowDiv = infoDiv.parentElement;
+      if (rowDiv && rowDiv.children.length > 1) {
+        const t = (rowDiv.children[1].textContent || "").trim();
+        if (t) draftingTeam = t;
+      }
+      return { name, pos, team, draftingTeam };
+    }
+
+    function checkForNewPick() {
+      const banner = readLastPickBanner();
+      if (!banner) return;
+      const isMe = /^you$/i.test(banner.draftingTeam) || banner.draftingTeam === "You";
+      const added = pushPick({
+        name: banner.name,
+        pos: banner.pos,
+        team: banner.draftingTeam,
+        isMe
+      });
+      if (added) panel.log(`Detected: ${banner.name} (${banner.pos || "?"}) -> ${banner.draftingTeam}`);
+    }
+
+    // Base poll — catches every pick even if WebSocket sniffing below doesn't fire.
+    setInterval(checkForNewPick, 1200);
+    checkForNewPick();
+
+    // WebSocket sniffing: use as a fast trigger only (not for parsing player data — Yahoo's
+    // draft socket protocol is pipe-delimited, not JSON, e.g. "D|3|3|30" fires right when a
+    // pick lands). IMPORTANT: must patch unsafeWindow, not window — Tampermonkey runs in an
+    // isolated JS world, so patching plain `window.WebSocket` never sees the page's real
+    // socket traffic. (This was the root cause of v1.0 detecting nothing at all.)
     const pageWindow = typeof unsafeWindow !== "undefined" ? unsafeWindow : window;
-
-    // Strategy A: sniff fetch() responses for anything draft/pick-shaped
-    const origFetch = pageWindow.fetch;
-    pageWindow.fetch = function (...args) {
-      return origFetch.apply(this, args).then(res => {
-        const url = typeof args[0] === "string" ? args[0] : (args[0] && args[0].url) || "";
-        if (/draft|pick/i.test(url)) {
-          res.clone().text().then(text => {
-            console.log("[FFDB sync] fetch from", url, "-> first 500 chars:", text.slice(0, 500));
-            tryParseDraftPayload(text, "fetch:" + url);
-          }).catch(() => {});
-        }
-        return res;
-      });
-    };
-
-    // Strategy A2: sniff XHR too, in case some calls use XMLHttpRequest instead of fetch
-    const origOpen = pageWindow.XMLHttpRequest.prototype.open;
-    pageWindow.XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-      this.addEventListener("load", function () {
-        if (/draft|pick/i.test(url)) {
-          console.log("[FFDB sync] XHR from", url, "-> first 500 chars:", String(this.responseText).slice(0, 500));
-          tryParseDraftPayload(this.responseText, "xhr:" + url);
-        }
-      });
-      return origOpen.call(this, method, url, ...rest);
-    };
-
-    // Strategy A3: WebSocket sniffing. Yahoo's own /fantasy/v3/draftstatus endpoint returns a
-    // dedicated draft_server + draft_port (a real AWS host, not the main API host) — that's a
-    // strong signal live picks are pushed over a WebSocket, not polled via HTTP at all. This
-    // patches the WebSocket constructor so any socket the page opens gets its messages logged.
     const OrigWebSocket = pageWindow.WebSocket;
     if (OrigWebSocket) {
       function PatchedWebSocket(url, protocols) {
         const ws = protocols !== undefined ? new OrigWebSocket(url, protocols) : new OrigWebSocket(url);
         console.log("[FFDB sync] WebSocket opened:", url);
-        panel.log("WebSocket opened: " + String(url).slice(0, 60));
         ws.addEventListener("message", (ev) => {
-          const data = typeof ev.data === "string" ? ev.data : null;
-          if (data) {
-            console.log("[FFDB sync] WS message from", url, "->", data.slice(0, 500));
-            tryParseDraftPayload(data, "ws:" + url);
+          if (typeof ev.data === "string" && /^D\|/.test(ev.data)) {
+            // "pick advanced" frame — re-check the banner right away instead of waiting for
+            // the next poll tick.
+            setTimeout(checkForNewPick, 150);
           }
         });
         return ws;
@@ -139,54 +162,7 @@
       pageWindow.WebSocket = PatchedWebSocket;
     }
 
-    function tryParseDraftPayload(text, source) {
-      let data;
-      try { data = JSON.parse(text); } catch (e) {
-        // Not JSON — still worth a peek in console if it's short, some draft protocols use
-        // lightweight delimited text frames over the socket rather than JSON.
-        if (text && text.length < 300) console.log("[FFDB sync] non-JSON payload from", source, text);
-        return;
-      }
-      // Walk the JSON looking for arrays of objects that look like {player, team, pick...}
-      const candidates = [];
-      (function walk(node, depth) {
-        if (depth > 6 || !node || typeof node !== "object") return;
-        if (Array.isArray(node)) {
-          for (const item of node) {
-            if (item && typeof item === "object") {
-              const keys = Object.keys(item).join(",").toLowerCase();
-              if (keys.includes("player") || keys.includes("pick")) candidates.push(item);
-            }
-          }
-        }
-        for (const k in node) walk(node[k], depth + 1);
-      })(data, 0);
-      if (candidates.length) {
-        panel.log(`${source}: found ${candidates.length} candidate pick objects (see console)`);
-        console.log("[FFDB sync] candidate pick objects from", source, candidates);
-      }
-    }
-
-    // Strategy B: DOM scraping fallback — several common patterns, none guaranteed, all safe no-ops if absent
-    function scrapeDom() {
-      const selectors = [
-        "[data-testid*='draft-result'] li",
-        ".draftresults tr",
-        ".ysf-draft-results li",
-        "#draftresults tbody tr",
-        "[class*='DraftResult']",
-      ];
-      for (const sel of selectors) {
-        const nodes = document.querySelectorAll(sel);
-        if (nodes.length) {
-          panel.log(`DOM strategy matched "${sel}" (${nodes.length} rows) — verify in console`);
-          console.log("[FFDB sync] DOM candidates for", sel, nodes);
-        }
-      }
-    }
-    setInterval(scrapeDom, 5000);
-
-    // Strategy C: manual fallback panel — lets you confirm a pick by typing a name if auto-detect misses one
+    // Manual fallback panel — lets you log a pick by hand if auto-detect ever misses one
     const manual = document.createElement("div");
     manual.style.cssText = "position:fixed;bottom:240px;right:10px;z-index:999999;background:#0b1120;border:1px solid #334155;border-radius:8px;padding:8px;";
     manual.innerHTML = `<input id="ffdb-manual-name" placeholder="Player name" style="width:160px;">
@@ -197,13 +173,12 @@
       const name = manual.querySelector("#ffdb-manual-name").value.trim();
       if (!name) return;
       const who = manual.querySelector("#ffdb-manual-who").value;
-      pickCounter++;
-      pushPick({ name, team: who === "mine" ? "Me" : "Unknown", isMe: who === "mine", pickNumber: Date.now() });
+      pushPick({ name, team: who === "mine" ? "Me" : "Unknown", isMe: who === "mine" });
       panel.log("Manually logged: " + name);
       manual.querySelector("#ffdb-manual-name").value = "";
     };
 
-    panel.log("Watching for picks… open console (F12) to see raw network data for tuning.");
+    panel.log("Watching the \"Last pick\" banner every 1.2s (+ instant on WS pick events).");
   }
 
   // ---------------- DRAFT BOARD SIDE ----------------
@@ -220,9 +195,9 @@
       const queue = getQueue();
       let appliedCount = 0;
       for (const pick of queue) {
-        const key = pick.name + "#" + pick.pickNumber;
+        const key = pick.name;
         if (applied.has(key)) continue;
-        const ok = uw.syncPickFromExternal(pick.name, pick.team, !!pick.isMe);
+        const ok = uw.syncPickFromExternal(pick.name, pick.team, !!pick.isMe, pick.pos);
         applied.add(key);
         if (ok) appliedCount++;
       }
@@ -231,7 +206,7 @@
         panel.log(`Applied ${appliedCount} new pick(s) from Yahoo tab`);
       }
     }
-    setInterval(poll, 3000);
-    panel.log("Polling for picks made on the Yahoo tab every 3s.");
+    setInterval(poll, 1500);
+    panel.log("Polling for picks made on the Yahoo tab every 1.5s.");
   }
 })();
