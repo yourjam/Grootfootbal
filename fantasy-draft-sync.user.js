@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fantasy Draft Board Live Sync (Yahoo -> Draft Board)
 // @namespace    jordan-three-phase-mafia
-// @version      1.5
+// @version      1.6
 // @description  No-OAuth, no-secrets bridge: reads picks off Yahoo's live draft page you're already logged into, and mirrors them into the draft board tab. Also works as a manual "click to log a pick" helper if auto-detection misses one.
 // @match        https://football.fantasysports.yahoo.com/*
 // @match        https://yourjam.github.io/Grootfootbal/*
@@ -168,10 +168,28 @@
       for (let i = 0; i < 3 && panel.parentElement; i++) panel = panel.parentElement;
       return panel;
     }
+    // v1.6 fix: the "Last:" banner already gives names in Yahoo's own abbreviated format
+    // ("J. Allen"), which matches the YOUR TEAM panel's format directly. But the new v1.5
+    // reconciliation sweep pulls FULL names off the Board tab's title attribute ("Josh Allen"),
+    // and panel.textContent.includes("Josh Allen") never matches text that only contains
+    // "J. Allen" — so every pick caught by reconciliation (instead of the banner) was silently
+    // never credited as mine. Confirmed live: Lamar Jackson, Jaxon Smith-Njigba, Rashee Rice,
+    // and De'Von Achane were all correctly detected and drafted, but all four were tagged
+    // "other" instead of "mine". Fixed by comparing last names only, which is present in both
+    // formats — strips common suffixes (Jr., III, etc.) first so e.g. "Harold Fannin Jr."
+    // still matches on "Fannin", not "Jr.".
+    function lastNameOf(fullName) {
+      const suffixes = new Set(["jr", "sr", "ii", "iii", "iv", "v"]);
+      const parts = fullName.trim().split(/\s+/);
+      while (parts.length > 1 && suffixes.has(parts[parts.length - 1].toLowerCase().replace(/\.$/, ""))) {
+        parts.pop();
+      }
+      return parts[parts.length - 1];
+    }
     function isMyPick(name) {
       const panel = findYourTeamPanel();
       if (!panel) return false;
-      return panel.textContent.includes(name);
+      return panel.textContent.includes(lastNameOf(name));
     }
 
     function checkForNewPick() {
