@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Fantasy Draft Board Live Sync (Yahoo -> Draft Board)
 // @namespace    jordan-three-phase-mafia
-// @version      1.4
+// @version      1.5
 // @description  No-OAuth, no-secrets bridge: reads picks off Yahoo's live draft page you're already logged into, and mirrors them into the draft board tab. Also works as a manual "click to log a pick" helper if auto-detection misses one.
 // @match        https://football.fantasysports.yahoo.com/*
 // @match        https://yourjam.github.io/Grootfootbal/*
@@ -52,11 +52,19 @@
   drafted players by name — confirmed correct in the same live draft (Jahmyr Gibbs now shows
   up as mine).
 
-  KNOWN LIMITATION: the "Last:" banner only ever shows the single most-recent pick. If two
-  picks happen faster than the ~1.2s poll (e.g. two people autodrafting back-to-back in the
-  same second), the earlier of the two could be skipped. This is very unlikely with real human
-  draft timers (30-90s+) but if the board ever looks like it skipped someone, use the manual
-  "Log pick" panel to catch it up — nothing else about the board depends on sync being perfect.
+  v1.5 fix: the "KNOWN LIMITATION" below turned out to be a real, confirmed miss, not just a
+  theoretical one — caught live in a 14-team mock where a pick landed and was never detected by
+  the banner at all (silently skipped, board and Yahoo's own Players-tab search both kept
+  showing the player as available for the rest of the draft). Root cause: the "Last:" banner
+  only ever holds the single most-recent pick, so if two picks land within the same ~1.2s poll
+  window, the earlier one is gone by the time the next poll checks. Fixed with a second,
+  independent detection path: every ~20s, briefly flips to the draft room's "Board" tab (which
+  renders the FULL pick history, not just the latest pick — each cell has a title attribute like
+  "Harold Fannin Jr., Cle-TE, 6.10" with name/team/position/pick-number all in one string),
+  scrapes every pick cell, queues anything the banner path hasn't already caught, then flips
+  back to the Players tab so your view isn't disrupted. This runs alongside the fast banner
+  poll, not instead of it — the banner path is still primary/instant, this is just a slower
+  safety net that guarantees nothing gets permanently missed even if two picks land back to back.
 */
 
 (function () {
@@ -207,6 +215,50 @@
       Object.setPrototypeOf(PatchedWebSocket, OrigWebSocket);
       pageWindow.WebSocket = PatchedWebSocket;
     }
+
+    // ---- Reconciliation sweep (v1.5): safety net for the banner's one-pick-at-a-time blind
+    // spot. Reads the Board tab's full grid instead of just the latest pick.
+    function findTabByLabel(label) {
+      return Array.from(document.querySelectorAll("a,button,div,span"))
+        .find(el => el.children.length === 0 && el.textContent.trim() === label);
+    }
+    function scrapeBoardGrid() {
+      const titleRe = /^(.+),\s*([A-Za-z]+)-([A-Za-z\/]+),\s*(\d+\.\d+)$/;
+      const cells = Array.from(document.querySelectorAll("[title]"));
+      const out = [];
+      for (const cell of cells) {
+        const t = (cell.getAttribute("title") || "").trim();
+        const m = t.match(titleRe);
+        if (!m) continue;
+        out.push({ name: m[1].trim(), team: m[2].trim(), pos: m[3].trim() });
+      }
+      return out;
+    }
+    function reconcileFromBoard() {
+      const boardTab = findTabByLabel("Board");
+      const playersTab = findTabByLabel("Players");
+      if (!boardTab || !playersTab) return; // not in a live draft room right now
+      boardTab.click();
+      setTimeout(() => {
+        const picks = scrapeBoardGrid();
+        let newCount = 0;
+        for (const pick of picks) {
+          const isMe = isMyPick(pick.name);
+          const added = pushPick({
+            name: pick.name,
+            pos: pick.pos,
+            team: isMe ? "Me" : "Reconciled (drafting team unknown)",
+            isMe
+          });
+          if (added) {
+            newCount++;
+            panel.log(`Reconciled (missed by banner): ${pick.name} (${pick.pos}) -> ${isMe ? "ME" : "other"}`);
+          }
+        }
+        playersTab.click();
+      }, 350);
+    }
+    setInterval(reconcileFromBoard, 20000);
 
     // Manual fallback panel — lets you log a pick by hand if auto-detect ever misses one
     const manual = document.createElement("div");
