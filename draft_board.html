@@ -260,13 +260,13 @@ function loadState() {
       if (!s.flags) s.flags = {};
       if (!s.rules) s.rules = { ...DEFAULT_RULES };
       if (!s.keeperCosts) s.keeperCosts = {};
-      if (!s.myDraftSlot) s.myDraftSlot = 1;
+      if (!s.myDraftSlot) s.myDraftSlot = 10;
       if (!s.pickLog) s.pickLog = [];
       return s;
     }
   } catch (e) {}
   return { drafted: {}, myPicks: [], config: { ...DEFAULT_CONFIG }, flags: {},
-    rules: { ...DEFAULT_RULES }, keeperCosts: {}, myDraftSlot: 1, pickLog: [] };
+    rules: { ...DEFAULT_RULES }, keeperCosts: {}, myDraftSlot: 10, pickLog: [] };
 }
 function saveState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
